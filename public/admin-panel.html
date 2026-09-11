@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<title>لوحة الإدارة</title>
+<style>
+    body { background:#0f0f1a; color:white; font-family:sans-serif; display:flex; justify-content:center; align-items:center; height:100vh; margin:0; }
+    .box { background:#1a1a2e; padding:25px; border-radius:12px; width:90%; max-width:360px; }
+    h2 { color:#f1c40f; margin-top:0; }
+    input { width:100%; padding:10px; margin:6px 0; border:none; border-radius:8px; background:#0f3460; color:white; box-sizing:border-box; }
+    button { width:100%; padding:12px; margin-top:10px; background:#f1c40f; border:none; border-radius:8px; color:#000; font-weight:bold; cursor:pointer; }
+    #msg { margin-top:10px; text-align:center; font-size:14px; }
+</style>
+</head>
+<body>
+<div class="box">
+    <h2>إدارة عليا</h2>
+    <input type="password" id="adminKey" placeholder="مفتاح الإدارة" autocomplete="off" />
+    <input type="text" id="userId" placeholder="ID المستخدم" />
+    <input type="text" id="newPassword" placeholder="كلمة السر الجديدة" />
+    <button onclick="resetPass()">إعادة تعيين كلمة السر</button>
+    <div id="msg"></div>
+</div>
+
+<script>
+function resetPass() {
+    const adminKey = document.getElementById('adminKey').value.trim();
+    const userId = document.getElementById('userId').value.trim();
+    const newPassword = document.getElementById('newPassword').value.trim();
+    const msg = document.getElementById('msg');
+    msg.textContent = '';
+
+    if (!adminKey || !userId || !newPassword) {
+        msg.textContent = 'املأ جميع الحقول';
+        msg.style.color = '#e74c3c';
+        return;
+    }
+
+    fetch('/admin/reset-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ adminKey, userId, newPassword })
+    })
+    .then(res => res.json())
+    .then(data => {
+        if (data.error) {
+            msg.textContent = data.error;
+            msg.style.color = '#e74c3c';
+        } else {
+            msg.textContent = data.message || 'تم بنجاح';
+            msg.style.color = '#2ecc71';
+            document.getElementById('userId').value = '';
+            document.getElementById('newPassword').value = '';
+        }
+    })
+    .catch(() => {
+        msg.textContent = 'حدث خطأ في الاتصال';
+        msg.style.color = '#e74c3c';
+    });
+}
+</script>
+</body>
+</html>
+

@@ -1,0 +1,8 @@
+{
+  "name": "جهازي",
+  "short_name": "جهازي",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f0f1a",
+  "theme_color": "#0f0f1a"
+}

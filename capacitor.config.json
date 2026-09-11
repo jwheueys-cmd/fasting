@@ -1,0 +1,9 @@
+{
+  "appId": "com.ueys.jahazi",
+  "appName": "Fasting",
+  "webDir": "public",
+  "server": {
+    "url": "https://ضع-دومين-ngrok-الثابت-هنا",
+    "cleartext": true
+  }
+}

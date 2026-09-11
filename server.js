@@ -1,0 +1,1137 @@
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
+const fs = require('fs');
+const path = require('path');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { DatabaseSync } = require('node:sqlite');
+const webpush = require('web-push');
+
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server);
+
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+    console.error('❌ JWT_SECRET غير موجود في .env — أنشئ ملف .env أول (راجع .env.example)');
+    process.exit(1);
+}
+
+// ===== إعداد الإشعارات الخارجية (Web Push) =====
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
+if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+    webpush.setVapidDetails('mailto:admin@example.com', VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+    console.log('🔔 الإشعارات الخارجية مفعّلة');
+} else {
+    console.log('⚠️ الإشعارات الخارجية غير مفعّلة (VAPID_PUBLIC_KEY/VAPID_PRIVATE_KEY ناقصين بـ .env)');
+}
+
+function signToken(userId) {
+    return jwt.sign({ userId }, JWT_SECRET, { expiresIn: '30d' });
+}
+
+// ===== ميدلوير التحقق من الهوية =====
+// يقرأ التوكن من الهيدر Authorization: Bearer <token>
+// ويحط الهوية المتحقق منها بـ req.userId (ما نثق أبداً بأي userId يرسله العميل بالجسم)
+function authenticateToken(req, res, next) {
+    const authHeader = req.headers['authorization'] || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
+    if (!token) {
+        return res.status(401).json({ error: 'يجب تسجيل الدخول' });
+    }
+
+    jwt.verify(token, JWT_SECRET, (err, payload) => {
+        if (err) {
+            return res.status(401).json({ error: 'الجلسة منتهية، سجّل الدخول من جديد' });
+        }
+        req.userId = payload.userId;
+        next();
+    });
+}
+
+// ميدلوير إضافي: يتأكد إن المستخدم يطلب بياناته هو فقط (لمسارات فيها :userId بالرابط)
+function ownParamOnly(paramName) {
+    return (req, res, next) => {
+        if (req.params[paramName] !== req.userId) {
+            return res.status(403).json({ error: 'غير مصرح' });
+        }
+        next();
+    };
+}
+
+app.use(express.static('public'));
+app.use(express.json({ limit: '10mb' }));
+
+// ===== المسارات =====
+const DATA_DIR = path.join(__dirname, 'data');
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
+const MESSAGES_FILE = path.join(DATA_DIR, 'messages.json');
+const GROUPS_FILE = path.join(DATA_DIR, 'groups.json');
+const BLOCKED_MESSAGES_FILE = path.join(DATA_DIR, 'blocked_messages.json');
+const UPLOAD_DIR = path.join(__dirname, 'public', 'uploads');
+
+if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+// ===== Rate Limit بسيط =====
+const rateLimitMap = new Map();
+function checkRateLimit(key, maxRequests = 10, windowMs = 10000) {
+    const now = Date.now();
+    if (!rateLimitMap.has(key)) {
+        rateLimitMap.set(key, []);
+    }
+    const requests = rateLimitMap.get(key).filter(t => now - t < windowMs);
+    if (requests.length >= maxRequests) {
+        return false;
+    }
+    requests.push(now);
+    rateLimitMap.set(key, requests);
+    return true;
+}
+// ===== قاعدة البيانات (SQLite المدمجة بـ Node.js، بدون أي تثبيت خارجي) =====
+const db = new DatabaseSync(path.join(DATA_DIR, 'app.db'));
+db.exec('PRAGMA journal_mode = WAL');
+db.exec(`
+    CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS messages (key TEXT PRIMARY KEY, data TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS chat_groups (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS blocked_messages (key TEXT PRIMARY KEY, data TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS push_subscriptions (endpoint TEXT PRIMARY KEY, userId TEXT NOT NULL, data TEXT NOT NULL);
+`);
+
+// نقل تلقائي لمرة وحدة من ملفات JSON القديمة (لو كانت موجودة وقاعدة البيانات لسا فاضية)
+(function migrateFromJsonIfNeeded() {
+    const userCount = db.prepare('SELECT COUNT(*) AS c FROM users').get().c;
+    if (userCount > 0 || !fs.existsSync(USERS_FILE)) return;
+
+    console.log('📦 نقل البيانات القديمة من ملفات JSON إلى قاعدة البيانات...');
+
+    const insertUser = db.prepare('INSERT OR REPLACE INTO users (id, data) VALUES (?, ?)');
+    const oldUsers = JSON.parse(fs.readFileSync(USERS_FILE));
+    for (const id in oldUsers) insertUser.run(id, JSON.stringify(oldUsers[id]));
+
+    if (fs.existsSync(MESSAGES_FILE)) {
+        const insertMsg = db.prepare('INSERT OR REPLACE INTO messages (key, data) VALUES (?, ?)');
+        const oldMessages = JSON.parse(fs.readFileSync(MESSAGES_FILE));
+        for (const key in oldMessages) insertMsg.run(key, JSON.stringify(oldMessages[key]));
+    }
+    if (fs.existsSync(GROUPS_FILE)) {
+        const insertGroup = db.prepare('INSERT OR REPLACE INTO chat_groups (id, data) VALUES (?, ?)');
+        const oldGroups = JSON.parse(fs.readFileSync(GROUPS_FILE));
+        for (const id in oldGroups) insertGroup.run(id, JSON.stringify(oldGroups[id]));
+    }
+    if (fs.existsSync(BLOCKED_MESSAGES_FILE)) {
+        const insertBlocked = db.prepare('INSERT OR REPLACE INTO blocked_messages (key, data) VALUES (?, ?)');
+        const oldBlocked = JSON.parse(fs.readFileSync(BLOCKED_MESSAGES_FILE));
+        for (const key in oldBlocked) insertBlocked.run(key, JSON.stringify(oldBlocked[key]));
+    }
+
+    console.log('✅ تم نقل البيانات بنجاح لقاعدة البيانات (app.db)');
+})();
+
+// ===== دوال مساعدة =====
+function getUsers() {
+    const rows = db.prepare('SELECT id, data FROM users').all();
+    const result = {};
+    rows.forEach(r => result[r.id] = JSON.parse(r.data));
+    return result;
+}
+
+function runInTransaction(fn) {
+    db.exec('BEGIN');
+    try {
+        fn();
+        db.exec('COMMIT');
+    } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+    }
+}
+
+const upsertUser = db.prepare('INSERT INTO users (id, data) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data');
+function saveUsers(users) {
+    runInTransaction(() => {
+        for (const id in users) upsertUser.run(id, JSON.stringify(users[id]));
+    });
+}
+
+function getMessages() {
+    const rows = db.prepare('SELECT key, data FROM messages').all();
+    const result = {};
+    rows.forEach(r => result[r.key] = JSON.parse(r.data));
+    return result;
+}
+
+const upsertMessages = db.prepare('INSERT INTO messages (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data');
+function saveMessages(messages) {
+    runInTransaction(() => {
+        for (const key in messages) upsertMessages.run(key, JSON.stringify(messages[key]));
+    });
+}
+
+function getGroups() {
+    const rows = db.prepare('SELECT id, data FROM chat_groups').all();
+    const result = {};
+    rows.forEach(r => result[r.id] = JSON.parse(r.data));
+    return result;
+}
+
+const upsertGroup = db.prepare('INSERT INTO chat_groups (id, data) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data');
+function saveGroups(groups) {
+    runInTransaction(() => {
+        for (const id in groups) upsertGroup.run(id, JSON.stringify(groups[id]));
+    });
+}
+
+function getBlockedMessages() {
+    const rows = db.prepare('SELECT key, data FROM blocked_messages').all();
+    const result = {};
+    rows.forEach(r => result[r.key] = JSON.parse(r.data));
+    return result;
+}
+
+const upsertBlocked = db.prepare('INSERT INTO blocked_messages (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data');
+function saveBlockedMessages(messages) {
+    runInTransaction(() => {
+        for (const key in messages) upsertBlocked.run(key, JSON.stringify(messages[key]));
+    });
+}
+
+function generateId() {
+    return Math.floor(1000000000 + Math.random() * 9000000000).toString();
+}
+
+function sanitize(text) {
+    if (typeof text !== 'string') return '';
+    return text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#x27;')
+        .trim();
+}
+
+// ===== إشعارات خارجية (Push) =====
+function saveSubscription(userId, subscription) {
+    const stmt = db.prepare('INSERT INTO push_subscriptions (endpoint, userId, data) VALUES (?, ?, ?) ON CONFLICT(endpoint) DO UPDATE SET data = excluded.data, userId = excluded.userId');
+    stmt.run(subscription.endpoint, userId, JSON.stringify(subscription));
+}
+
+function getSubscriptionsForUser(userId) {
+    const rows = db.prepare('SELECT data FROM push_subscriptions WHERE userId = ?').all(userId);
+    return rows.map(r => JSON.parse(r.data));
+}
+
+function deleteSubscription(endpoint) {
+    db.prepare('DELETE FROM push_subscriptions WHERE endpoint = ?').run(endpoint);
+}
+
+function sendPushToUser(userId, payload) {
+    if (!VAPID_PUBLIC_KEY) return; // الإشعارات الخارجية غير مفعّلة أصلاً
+    getSubscriptionsForUser(userId).forEach(sub => {
+        webpush.sendNotification(sub, JSON.stringify(payload)).catch(err => {
+            if (err.statusCode === 404 || err.statusCode === 410) {
+                deleteSubscription(sub.endpoint); // اشتراك منتهي/غير صالح، نحذفه
+            } else {
+                console.error('Push error:', err.message);
+            }
+        });
+    });
+}
+
+const onlineUsers = new Set();
+
+// ===== تسجيل حساب جديد =====
+app.post('/register', async (req, res) => {
+    try {
+        const { username, password } = req.body;
+
+        if (!username || !password) {
+            return res.json({ error: 'املأ جميع الحقول' });
+        }
+        if (password.length < 6) {
+            return res.json({ error: 'كلمة السر يجب أن تكون 6 أحرف أو أكثر' });
+        }
+        if (username.length < 3 || username.length > 20) {
+            return res.json({ error: 'اسم المستخدم يجب أن يكون بين 3 و 20 حرف' });
+        }
+
+        const users = getUsers();
+        for (let id in users) {
+            if (users[id].username === username) {
+                return res.json({ error: 'الاسم مستخدم بالفعل' });
+            }
+        }
+
+        let userId = generateId();
+        while (users[userId]) userId = generateId();
+
+        const hashedPassword = await bcrypt.hash(password, 10);
+
+        users[userId] = {
+            username: sanitize(username),
+            password: hashedPassword,
+            friends: [],
+            pendingRequests: [],
+            sentRequests: [],
+            blocked: [],
+            groups: [],
+            pinnedChats: [],
+            createdAt: Date.now()
+        };
+
+        saveUsers(users);
+        res.json({ userId, token: signToken(userId) });
+    } catch (err) {
+        console.error('Register error:', err);
+        res.json({ error: 'حدث خطأ أثناء التسجيل' });
+    }
+});
+
+// ===== تسجيل دخول =====
+app.post('/login', async (req, res) => {
+    try {
+        const { username, password } = req.body;
+        if (!username || !password) {
+            return res.json({ error: 'املأ جميع الحقول' });
+        }
+
+        const users = getUsers();
+        for (let id in users) {
+            if (users[id].username === username) {
+                const match = await bcrypt.compare(password, users[id].password);
+                if (match) {
+                    return res.json({ userId: id, token: signToken(id) });
+                }
+            }
+        }
+        res.json({ error: 'الاسم أو كلمة السر خطأ' });
+    } catch (err) {
+        console.error('Login error:', err);
+        res.json({ error: 'حدث خطأ أثناء الدخول' });
+    }
+});
+
+// ===== استرجاع الحساب (آمن) =====
+app.post('/recover', (req, res) => {
+    const { username, userId } = req.body;
+    const users = getUsers();
+
+    if (users[userId] && users[userId].username === username) {
+        return res.json({
+            success: true,
+            message: 'الحساب موجود. تواصل مع المطور لإعادة تعيين كلمة السر.'
+        });
+    }
+    res.json({ error: 'الاسم أو ID غير صحيح' });
+});
+// ===== إرسال طلب صداقة =====
+app.post('/friend-request', authenticateToken, (req, res) => {
+    const fromId = req.userId;
+    const { toId } = req.body;
+
+    if (!checkRateLimit(`friend_${fromId}`, 5, 30000)) {
+        return res.json({ error: 'تراسلت كثير، انتظر قليلاً' });
+    }
+
+    const users = getUsers();
+
+    if (!users[fromId] || !users[toId]) {
+        return res.json({ error: 'مستخدم غير موجود' });
+    }
+    if (fromId === toId) {
+        return res.json({ error: 'ما تقدر تضيف نفسك' });
+    }
+    if (users[fromId].friends.includes(toId)) {
+        return res.json({ error: 'أنتم أصدقاء بالفعل' });
+    }
+    if (users[toId].pendingRequests.includes(fromId)) {
+        return res.json({ error: 'طلب موجود مسبقاً' });
+    }
+    if ((users[fromId].blocked || []).includes(toId) || (users[toId].blocked || []).includes(fromId)) {
+        return res.json({ error: 'لا يمكن الإضافة، المستخدم محظور' });
+    }
+
+    users[toId].pendingRequests.push(fromId);
+    users[fromId].sentRequests.push(toId);
+    saveUsers(users);
+
+    io.to(toId).emit('friend-request', {
+        fromId,
+        fromName: users[fromId].username
+    });
+
+    res.json({ success: true });
+});
+
+// ===== قبول طلب صداقة =====
+app.post('/accept-request', authenticateToken, (req, res) => {
+    const userId = req.userId;
+    const { friendId } = req.body;
+    const users = getUsers();
+
+    if (!users[userId] || !users[friendId]) {
+        return res.json({ error: 'مستخدم غير موجود' });
+    }
+
+    users[userId].pendingRequests = users[userId].pendingRequests.filter(id => id !== friendId);
+    users[friendId].sentRequests = users[friendId].sentRequests.filter(id => id !== userId);
+
+    if (!users[userId].friends.includes(friendId)) {
+        users[userId].friends.push(friendId);
+    }
+    if (!users[friendId].friends.includes(userId)) {
+        users[friendId].friends.push(userId);
+    }
+
+    saveUsers(users);
+
+    io.to(userId).emit('friend-accepted', { friendId });
+    io.to(friendId).emit('friend-accepted', { friendId: userId });
+
+    res.json({ success: true });
+});
+
+// ===== رفض طلب صداقة =====
+app.post('/reject-request', authenticateToken, (req, res) => {
+    const userId = req.userId;
+    const { friendId } = req.body;
+    const users = getUsers();
+
+    if (!users[userId] || !users[friendId]) {
+        return res.json({ error: 'مستخدم غير موجود' });
+    }
+
+    users[userId].pendingRequests = users[userId].pendingRequests.filter(id => id !== friendId);
+    users[friendId].sentRequests = users[friendId].sentRequests.filter(id => id !== userId);
+
+    saveUsers(users);
+    res.json({ success: true });
+});
+
+// ===== حظر مستخدم =====
+app.post('/block-user', authenticateToken, (req, res) => {
+    const userId = req.userId;
+    const { blockId } = req.body;
+    const users = getUsers();
+
+    if (!users[userId] || !users[blockId]) {
+        return res.json({ error: 'مستخدم غير موجود' });
+    }
+
+    if (!users[userId].blocked) users[userId].blocked = [];
+    if (!users[userId].blocked.includes(blockId)) {
+        users[userId].blocked.push(blockId);
+    }
+
+    users[userId].friends = users[userId].friends.filter(id => id !== blockId);
+    users[blockId].friends = users[blockId].friends.filter(id => id !== userId);
+
+    // إزالة الطلبات المعلقة أيضاً
+    users[userId].pendingRequests = users[userId].pendingRequests.filter(id => id !== blockId);
+    users[blockId].pendingRequests = users[blockId].pendingRequests.filter(id => id !== userId);
+
+    saveUsers(users);
+    res.json({ success: true });
+});
+
+// ===== فك حظر =====
+app.post('/unblock-user', authenticateToken, (req, res) => {
+    const userId = req.userId;
+    const { blockId } = req.body;
+    const users = getUsers();
+
+    if (!users[userId]) return res.json({ error: 'مستخدم غير موجود' });
+
+    users[userId].blocked = (users[userId].blocked || []).filter(id => id !== blockId);
+    saveUsers(users);
+    res.json({ success: true });
+});
+
+// ===== تغيير اسم المستخدم =====
+app.post('/change-username', authenticateToken, (req, res) => {
+    const userId = req.userId;
+    const { newName } = req.body;
+    const users = getUsers();
+
+    if (!users[userId]) {
+        return res.json({ error: 'مستخدم غير موجود' });
+    }
+    if (!newName || newName.length < 3 || newName.length > 20) {
+        return res.json({ error: 'الاسم يجب أن يكون بين 3 و 20 حرف' });
+    }
+
+    for (let id in users) {
+        if (users[id].username === newName && id !== userId) {
+            return res.json({ error: 'الاسم مستخدم من قبل' });
+        }
+    }
+
+    users[userId].username = sanitize(newName);
+    saveUsers(users);
+    res.json({ success: true });
+});
+
+// ===== تغيير كلمة السر =====
+app.post('/change-password', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.userId;
+        const { oldPassword, newPassword } = req.body;
+        const users = getUsers();
+
+        if (!users[userId]) {
+            return res.json({ error: 'مستخدم غير موجود' });
+        }
+
+        const match = await bcrypt.compare(oldPassword, users[userId].password);
+        if (!match) {
+            return res.json({ error: 'كلمة السر القديمة غير صحيحة' });
+        }
+
+        if (!newPassword || newPassword.length < 6) {
+            return res.json({ error: 'كلمة السر الجديدة يجب أن تكون 6 أحرف أو أكثر' });
+        }
+
+        users[userId].password = await bcrypt.hash(newPassword, 10);
+        saveUsers(users);
+        res.json({ success: true });
+    } catch (err) {
+        res.json({ error: 'حدث خطأ' });
+    }
+});
+
+// ===== إعادة تعيين كلمة السر (للإدارة العليا فقط) =====
+app.post('/admin/reset-password', async (req, res) => {
+    const { adminKey, userId, newPassword } = req.body;
+
+    // مفتاح الإدارة يُقرأ من ملف .env السري (غير موجود بالكود إطلاقاً)
+    const SECRET_ADMIN_KEY = process.env.ADMIN_KEY;
+    if (!SECRET_ADMIN_KEY) {
+        return res.json({ error: 'لم يتم إعداد مفتاح الإدارة على السيرفر' });
+    }
+
+    if (adminKey !== SECRET_ADMIN_KEY) {
+        return res.json({ error: 'غير مصرح لك' });
+    }
+
+    if (!userId || !newPassword) {
+        return res.json({ error: 'البيانات ناقصة' });
+    }
+
+    if (newPassword.length < 6) {
+        return res.json({ error: 'كلمة السر يجب أن تكون 6 أحرف أو أكثر' });
+    }
+
+    const users = getUsers();
+    if (!users[userId]) {
+        return res.json({ error: 'المستخدم غير موجود' });
+    }
+
+    users[userId].password = await bcrypt.hash(newPassword, 10);
+    saveUsers(users);
+
+    res.json({ 
+        success: true, 
+        message: `تم تغيير كلمة سر المستخدم ${users[userId].username} بنجاح` 
+    });
+});
+
+// ===== تعديل رسالة =====
+app.post('/edit-message', authenticateToken, (req, res) => {
+    const userId = req.userId;
+    const { friendId, messageId, newMessage, isGroup = false } = req.body;
+    const messages = getMessages();
+    let key = isGroup ? `group_${friendId}` : [userId, friendId].sort().join('_');
+
+    if (!messages[key]) {
+        return res.json({ error: 'المحادثة غير موجودة' });
+    }
+
+    const msg = messages[key].find(m => m.timestamp === Number(messageId));
+    if (!msg) {
+        return res.json({ error: 'الرسالة غير موجودة' });
+    }
+    if (msg.fromId !== userId) {
+        return res.json({ error: 'ليس لديك صلاحية تعديل هذه الرسالة' });
+    }
+    if (!newMessage || newMessage.trim().length === 0) {
+        return res.json({ error: 'الرسالة فارغة' });
+    }
+    if (newMessage.length > 1000) {
+        return res.json({ error: 'الرسالة طويلة جداً (الحد 1000 حرف)' });
+    }
+
+    msg.message = sanitize(newMessage);
+    msg.edited = true;
+    msg.editTime = new Date().toLocaleTimeString('ar-EG');
+    saveMessages(messages);
+    res.json({ success: true });
+});
+
+// ===== حذف رسالة (من عندي فقط) =====
+app.post('/delete-message-me', authenticateToken, (req, res) => {
+    const userId = req.userId;
+    const { friendId, messageId, isGroup = false } = req.body;
+    const messages = getMessages();
+    let key = isGroup ? `group_${friendId}` : [userId, friendId].sort().join('_');
+
+    if (!messages[key]) return res.json({ error: 'المحادثة غير موجودة' });
+
+    const msg = messages[key].find(m => m.timestamp === Number(messageId));
+    if (!msg) return res.json({ error: 'الرسالة غير موجودة' });
+    if (msg.fromId !== userId) return res.json({ error: 'ليس لديك صلاحية' });
+
+    msg.deletedForMe = true;
+    saveMessages(messages);
+    res.json({ success: true });
+});
+
+// ===== حذف رسالة نهائياً =====
+app.post('/delete-message-everyone', authenticateToken, (req, res) => {
+    const userId = req.userId;
+    const { friendId, messageId, isGroup = false } = req.body;
+    const messages = getMessages();
+    let key = isGroup ? `group_${friendId}` : [userId, friendId].sort().join('_');
+
+    if (!messages[key]) return res.json({ error: 'المحادثة غير موجودة' });
+
+    const msgIndex = messages[key].findIndex(m => m.timestamp === Number(messageId));
+    if (msgIndex === -1) return res.json({ error: 'الرسالة غير موجودة' });
+
+    if (messages[key][msgIndex].fromId !== userId) {
+        return res.json({ error: 'ليس لديك صلاحية' });
+    }
+
+    messages[key].splice(msgIndex, 1);
+    saveMessages(messages);
+    res.json({ success: true });
+});
+
+// ===== حذف كل المحادثات (كانت هذي الميزة ناقصة تماماً) =====
+app.post('/clear-messages', authenticateToken, (req, res) => {
+    const userId = req.userId;
+    const messages = getMessages();
+
+    for (const key in messages) {
+        if (key.startsWith('group_')) continue; // ما نمسح محادثات المجموعات من هنا
+        const parts = key.split('_');
+        if (parts.includes(userId)) {
+            delete messages[key];
+        }
+    }
+
+    saveMessages(messages);
+    res.json({ success: true });
+});
+
+// ===== إضافة/تحديث رد فعل على رسالة (كانت هذي الميزة ناقصة تماماً) =====
+app.post('/add-reaction', authenticateToken, (req, res) => {
+    const userId = req.userId;
+    const { friendId, messageId, reaction, isGroup = false } = req.body;
+
+    if (!reaction || typeof reaction !== 'string' || reaction.length > 8) {
+        return res.json({ error: 'رمز غير صالح' });
+    }
+
+    // لازم يكون المستخدم صاحب صلاحية بالمحادثة (طرف فيها أو عضو بالمجموعة)
+    if (isGroup) {
+        const groups = getGroups();
+        const group = groups[friendId];
+        if (!group || !group.members.includes(userId)) {
+            return res.status(403).json({ error: 'غير مصرح' });
+        }
+    }
+
+    const messages = getMessages();
+    const key = isGroup ? `group_${friendId}` : [userId, friendId].sort().join('_');
+
+    if (!messages[key]) return res.json({ error: 'المحادثة غير موجودة' });
+
+    const msg = messages[key].find(m => m.timestamp === Number(messageId));
+    if (!msg) return res.json({ error: 'الرسالة غير موجودة' });
+
+    if (!msg.reactions) msg.reactions = {};
+    // لو نفس المستخدم كرر نفس الرمز، نشيله (toggle)
+    if (msg.reactions[userId] === reaction) {
+        delete msg.reactions[userId];
+    } else {
+        msg.reactions[userId] = reaction;
+    }
+
+    saveMessages(messages);
+
+    const payload = {
+        messageId: Number(messageId),
+        reactions: msg.reactions,
+        ...(isGroup ? { groupId: friendId } : { fromId: userId, toId: friendId })
+    };
+
+    if (isGroup) {
+        const groups = getGroups();
+        groups[friendId].members.forEach(memberId => {
+            io.to(memberId).emit('reaction-updated', payload);
+        });
+    } else {
+        io.to(userId).emit('reaction-updated', payload);
+        io.to(friendId).emit('reaction-updated', payload);
+    }
+
+    res.json({ success: true, reactions: msg.reactions });
+});
+
+// ===== تثبيت محادثة =====
+app.post('/pin-chat', authenticateToken, (req, res) => {
+    const userId = req.userId;
+    const { friendId, pinned } = req.body;
+    const users = getUsers();
+
+    if (!users[userId]) return res.json({ error: 'مستخدم غير موجود' });
+    if (!users[userId].pinnedChats) users[userId].pinnedChats = [];
+
+    if (pinned) {
+        if (!users[userId].pinnedChats.includes(friendId)) {
+            users[userId].pinnedChats.push(friendId);
+        }
+    } else {
+        users[userId].pinnedChats = users[userId].pinnedChats.filter(id => id !== friendId);
+    }
+
+    saveUsers(users);
+    res.json({ success: true });
+});
+// ===== إنشاء مجموعة =====
+app.post('/create-group', authenticateToken, (req, res) => {
+    const adminId = req.userId;
+    const { name, members } = req.body;
+    const users = getUsers();
+    const groups = getGroups();
+
+    if (!name || name.trim().length < 2) {
+        return res.json({ error: 'اسم المجموعة قصير جداً' });
+    }
+
+    let groupId = generateId();
+    while (groups[groupId]) groupId = generateId();
+
+    const cleanMembers = Array.isArray(members) ? members.filter(id => id && id !== adminId) : [];
+
+    groups[groupId] = {
+        id: groupId,
+        name: sanitize(name),
+        admin: adminId,
+        members: [adminId, ...cleanMembers],
+        created: Date.now()
+    };
+
+    groups[groupId].members.forEach(memberId => {
+        if (users[memberId]) {
+            if (!users[memberId].groups) users[memberId].groups = [];
+            if (!users[memberId].groups.includes(groupId)) {
+                users[memberId].groups.push(groupId);
+            }
+        }
+    });
+
+    saveGroups(groups);
+    saveUsers(users);
+
+    groups[groupId].members.forEach(memberId => {
+        io.to(memberId).emit('group-created', {
+            groupId,
+            name: groups[groupId].name,
+            adminId
+        });
+    });
+
+    res.json({ groupId });
+});
+
+// ===== إضافة عضو للمجموعة =====
+app.post('/add-group-member', authenticateToken, (req, res) => {
+    const adminId = req.userId;
+    const { groupId, memberId } = req.body;
+    const users = getUsers();
+    const groups = getGroups();
+
+    if (!groups[groupId] || groups[groupId].admin !== adminId) {
+        return res.json({ error: 'غير مصرح' });
+    }
+
+    if (!groups[groupId].members.includes(memberId)) {
+        groups[groupId].members.push(memberId);
+        if (users[memberId]) {
+            if (!users[memberId].groups) users[memberId].groups = [];
+            users[memberId].groups.push(groupId);
+        }
+        saveGroups(groups);
+        saveUsers(users);
+        io.to(memberId).emit('group-added', { groupId, name: groups[groupId].name });
+    }
+
+    res.json({ success: true });
+});
+
+// ===== جلب مجموعات المستخدم =====
+app.get('/groups/:userId', authenticateToken, ownParamOnly('userId'), (req, res) => {
+    const users = getUsers();
+    const groups = getGroups();
+    const user = users[req.params.userId];
+
+    if (!user) return res.json({ error: 'مستخدم غير موجود' });
+
+    const userGroups = (user.groups || []).map(groupId => {
+        const group = groups[groupId];
+        if (!group) return null;
+        return {
+            id: groupId,
+            name: group.name,
+            admin: group.admin,
+            members: group.members
+        };
+    }).filter(Boolean);
+
+    res.json({ groups: userGroups });
+});
+
+// ===== جلب محادثة فردية =====
+app.get('/messages/:userId/:friendId', authenticateToken, ownParamOnly('userId'), (req, res) => {
+    const { userId, friendId } = req.params;
+    const messages = getMessages();
+    const key = [userId, friendId].sort().join('_');
+    res.json({ messages: messages[key] || [] });
+});
+
+// ===== جلب محادثة مجموعة =====
+app.get('/group-messages/:groupId', authenticateToken, (req, res) => {
+    const groups = getGroups();
+    const group = groups[req.params.groupId];
+    if (!group || !group.members.includes(req.userId)) {
+        return res.status(403).json({ error: 'غير مصرح' });
+    }
+    const messages = getMessages();
+    const key = `group_${req.params.groupId}`;
+    res.json({ messages: messages[key] || [] });
+});
+
+// ===== جلب رسائل المحظورين =====
+app.get('/blocked-messages/:userId/:friendId', authenticateToken, ownParamOnly('userId'), (req, res) => {
+    const blockedMessages = getBlockedMessages();
+    const key = [req.params.userId, req.params.friendId].sort().join('_');
+    res.json({ messages: blockedMessages[key] || [] });
+});
+
+// ===== رفع الصور (محسّن) =====
+app.post('/upload-image', authenticateToken, (req, res) => {
+    const { image } = req.body;
+    if (!image) return res.json({ error: 'لا توجد صورة' });
+
+    try {
+        const matches = image.match(/^data:image\/(jpeg|jpg|png|gif|webp);base64,(.+)$/i);
+        if (!matches) {
+            return res.json({ error: 'صيغة غير مدعومة (jpeg, png, gif, webp فقط)' });
+        }
+
+        const base64Data = matches[2];
+        const sizeInBytes = (base64Data.length * 3) / 4;
+
+        if (sizeInBytes > 5 * 1024 * 1024) {
+            return res.json({ error: 'الصورة كبيرة جداً (الحد 5 ميجا)' });
+        }
+
+        if (!fs.existsSync(UPLOAD_DIR)) {
+            fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+        }
+
+        const ext = matches[1] === 'jpeg' ? 'jpg' : matches[1];
+        const filename = `img_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
+        const filepath = path.join(UPLOAD_DIR, filename);
+
+        fs.writeFileSync(filepath, base64Data, 'base64');
+        res.json({ url: `/uploads/${filename}` });
+} catch (err) {
+        console.error('Upload error:', err.message);
+        res.json({ error: 'فشل رفع الصورة' });
+    }
+});
+
+// ===== رفع الصورة الشخصية =====
+app.post('/upload-avatar', authenticateToken, (req, res) => {
+    const userId = req.userId;
+    const { image } = req.body;
+    if (!image) {
+        return res.json({ error: 'بيانات ناقصة' });
+    }
+
+    const users = getUsers();
+    if (!users[userId]) {
+        return res.json({ error: 'مستخدم غير موجود' });
+    }
+
+    try {
+        const matches = image.match(/^data:image\/(jpeg|jpg|png|webp);base64,(.+)$/i);
+        if (!matches) {
+            return res.json({ error: 'صيغة غير مدعومة' });
+        }
+
+        const base64Data = matches[2];
+        const sizeInBytes = Math.ceil((base64Data.length * 3) / 4);
+
+        if (sizeInBytes > 3 * 1024 * 1024) {
+            return res.json({ error: 'الصورة كبيرة (الحد 3 ميجا)' });
+        }
+
+        if (!fs.existsSync(UPLOAD_DIR)) {
+            fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+        }
+
+        const ext = matches[1] === 'jpeg' ? 'jpg' : matches[1];
+        const filename = 'avatar_' + userId + '_' + Date.now() + '.' + ext;
+        const filepath = path.join(UPLOAD_DIR, filename);
+
+        fs.writeFileSync(filepath, base64Data, 'base64');
+        const url = '/uploads/' + filename;
+
+        users[userId].avatar = url;
+        saveUsers(users);
+
+        res.json({ url: url });
+    } catch (err) {
+        console.error('Avatar upload error:', err);
+        res.json({ error: 'فشل رفع الصورة' });
+    }
+});
+// ===== تحديث النبذة =====
+app.post('/update-bio', authenticateToken, (req, res) => {
+    const userId = req.userId;
+    const { bio } = req.body;
+    const users = getUsers();
+
+    if (!users[userId]) return res.json({ error: 'مستخدم غير موجود' });
+
+    users[userId].bio = sanitize(bio || '').substring(0, 200);
+    saveUsers(users);
+
+    res.json({ success: true });
+});
+
+// ===== حالة الاتصال =====
+app.get('/online-status/:userId', authenticateToken, (req, res) => {
+    res.json({ online: onlineUsers.has(req.params.userId) });
+});
+
+// ===== قائمة الأصدقاء =====
+app.get('/friends/:id', authenticateToken, ownParamOnly('id'), (req, res) => {
+    const users = getUsers();
+    const user = users[req.params.id];
+    if (!user) return res.json({ error: 'مستخدم غير موجود' });
+
+    if (!user.blocked) user.blocked = [];
+    if (!user.pinnedChats) user.pinnedChats = [];
+
+    const friendsList = user.friends
+        .filter(fid => !user.blocked.includes(fid))
+        .map(fid => ({
+            id: fid,
+            username: users[fid]?.username || 'غير معروف',
+            online: onlineUsers.has(fid),
+            pinned: user.pinnedChats.includes(fid)
+        }));
+
+    friendsList.sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0));
+    res.json({ friends: friendsList });
+});
+
+// ===== المفتاح العام لتفعيل الإشعارات الخارجية بالواجهة =====
+app.get('/vapid-public-key', (req, res) => {
+    res.json({ key: VAPID_PUBLIC_KEY || '' });
+});
+
+// ===== حفظ اشتراك إشعارات الجهاز =====
+app.post('/save-subscription', authenticateToken, (req, res) => {
+    const { subscription } = req.body;
+    if (!subscription || !subscription.endpoint) {
+        return res.json({ error: 'بيانات اشتراك غير صالحة' });
+    }
+    saveSubscription(req.userId, subscription);
+    res.json({ success: true });
+});
+
+// ===== بيانات مستخدم =====
+app.get('/user/:id', authenticateToken, (req, res) => {
+    const users = getUsers();
+    const user = users[req.params.id];
+    if (!user) return res.json({ error: 'مستخدم غير موجود' });
+
+    const { password, ...safeUser } = user;
+    res.json({ user: safeUser });
+});
+
+// ===== Socket.io =====
+io.use((socket, next) => {
+    const token = socket.handshake.auth?.token;
+    if (!token) return next(new Error('unauthorized'));
+
+    jwt.verify(token, JWT_SECRET, (err, payload) => {
+        if (err) return next(new Error('unauthorized'));
+        socket.userId = payload.userId;
+        next();
+    });
+});
+
+io.on('connection', (socket) => {
+    const userId = socket.userId;
+
+    if (userId) {
+        socket.join(userId);
+        onlineUsers.add(userId);
+        console.log(`🟢 متصل: ${userId}`);
+        socket.broadcast.emit('user-online', { userId });
+    }
+
+    socket.on('typing-start', ({ toId }) => {
+        if (toId) io.to(toId).emit('typing-start', { fromId: userId });
+    });
+
+    socket.on('typing-stop', ({ toId }) => {
+        if (toId) io.to(toId).emit('typing-stop', { fromId: userId });
+    });
+
+    socket.on('send-message', (data) => {
+        const { toId, message, type = 'text', imageUrl = null, replyData = null } = data;
+        if (!userId || !toId) return;
+
+        if (!checkRateLimit(`msg_${userId}`, 15, 10000)) return;
+
+        const cleanMessage = sanitize(message || '');
+        if (type === 'text' && (!cleanMessage || cleanMessage.length === 0)) return;
+        if (cleanMessage.length > 1000) return;
+
+        const users = getUsers();
+        const isBlocked = (users[userId]?.blocked || []).includes(toId) || 
+                          (users[toId]?.blocked || []).includes(userId);
+
+        const time = new Date().toLocaleTimeString('ar-EG');
+        const timestamp = Date.now();
+
+        const newMessage = {
+            fromId: userId,
+            toId,
+            message: cleanMessage,
+            type,
+            imageUrl,
+            time,
+            timestamp,
+            replyData: replyData || null
+        };
+
+        if (isBlocked) {
+            const blocked = getBlockedMessages();
+            const key = [userId, toId].sort().join('_');
+            if (!blocked[key]) blocked[key] = [];
+            blocked[key].push(newMessage);
+            saveBlockedMessages(blocked);
+            return;
+        }
+
+        const messages = getMessages();
+        const key = [userId, toId].sort().join('_');
+        if (!messages[key]) messages[key] = [];
+        messages[key].push(newMessage);
+        saveMessages(messages);
+
+        io.to(toId).emit('new-message', {
+            fromId: userId,
+            message: cleanMessage,
+            type,
+            imageUrl,
+            time,
+            replyData: replyData || null,
+            timestamp
+        });
+
+        if (!onlineUsers.has(toId)) {
+            sendPushToUser(toId, {
+                title: users[userId]?.username || 'رسالة جديدة',
+                body: type === 'text' ? cleanMessage : '📷 صورة',
+                fromId: userId
+            });
+        }
+    });
+
+    socket.on('send-group-message', (data) => {
+        const { groupId, message, type = 'text', imageUrl = null, replyData = null } = data;
+        if (!userId || !groupId) return;
+
+        if (!checkRateLimit(`gmsg_${userId}`, 15, 10000)) return;
+
+        const groups = getGroups();
+        const group = groups[groupId];
+        if (!group || !group.members.includes(userId)) return;
+
+        const cleanMessage = sanitize(message || '');
+        if (type === 'text' && (!cleanMessage || cleanMessage.length === 0)) return;
+
+        const time = new Date().toLocaleTimeString('ar-EG');
+        const timestamp = Date.now();
+
+        const newMessage = {
+            fromId: userId,
+            groupId,
+            message: cleanMessage,
+            type,
+            imageUrl,
+            time,
+            timestamp,
+            replyData: replyData || null
+        };
+
+        const messages = getMessages();
+        const key = `group_${groupId}`;
+        if (!messages[key]) messages[key] = [];
+        messages[key].push(newMessage);
+        saveMessages(messages);
+
+        group.members.forEach(memberId => {
+            if (memberId !== userId) {
+                io.to(memberId).emit('new-group-message', {
+                    groupId,
+                    fromId: userId,
+                    message: cleanMessage,
+                    type,
+                    imageUrl,
+                    time,
+                    replyData: replyData || null,
+                    timestamp
+                });
+
+                if (!onlineUsers.has(memberId)) {
+                    const users = getUsers();
+                    sendPushToUser(memberId, {
+                        title: `${group.name}: ${users[userId]?.username || ''}`,
+                        body: type === 'text' ? cleanMessage : '📷 صورة',
+                        fromId: userId
+                    });
+                }
+            }
+        });
+    });
+    socket.on('disconnect', () => {
+        if (userId) {
+            onlineUsers.delete(userId);
+            console.log(`🔴 فصل: ${userId}`);
+            socket.broadcast.emit('user-offline', { userId });
+        }
+    });
+});
+
+// ===== تشغيل السيرفر =====
+const PORT = 3000;
+server.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 السيرفر شغال على http://0.0.0.0:${PORT}`);
+});
