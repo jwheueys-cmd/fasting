@@ -10,6 +10,7 @@ let isLoginMode = false;
 let isRecoverMode = false;
 let typingTimeout = null;
 let isTyping = false;
+let pendingGroupMemberIds = [];
 
 // ===== طلبات موثّقة (ترفق التوكن تلقائياً) =====
 function authFetch(url, options = {}) {
@@ -361,6 +362,23 @@ function enterApp(userId, username) {
     loadPendingRequests();
     loadGroups();
     requestNotificationPermission();
+    loadHeaderAvatar();
+}
+
+// ===== تحميل الصورة الشخصية بالهيدر فور الدخول =====
+function loadHeaderAvatar() {
+    authFetch(`/user/${myId}`)
+        .then(res => res.json())
+        .then(data => {
+            if (!data.user) return;
+            const headerAvatar = document.getElementById('headerAvatar');
+            if (data.user.avatar) {
+                headerAvatar.innerHTML = `<img src="${data.user.avatar}" style="width:100%; height:100%; border-radius:50%; object-fit:cover;">`;
+            } else {
+                headerAvatar.textContent = data.user.username.charAt(0).toUpperCase();
+            }
+        })
+        .catch(() => {});
 }
 
 // ===== محاولة الدخول التلقائي عند فتح الصفحة (لو فيه جلسة محفوظة) =====
@@ -1214,18 +1232,49 @@ async function deleteMessageEveryone(messageId, friendId, isGroup) {
     });
 }
 
+// ===== إضافة عضو لقائمة أعضاء المجموعة قبل الإنشاء =====
+function addGroupMemberToList() {
+    const input = document.getElementById('groupMemberIdInput');
+    const id = input.value.trim();
+    if (!id) return;
+
+    if (id === myId) {
+        modalError('ما تحتاج تضيف ID خاصتك، أنت أصلاً بتصير أدمن المجموعة');
+        input.value = '';
+        return;
+    }
+    if (pendingGroupMemberIds.includes(id)) {
+        modalError('هذا العضو مضاف مسبقاً');
+        input.value = '';
+        return;
+    }
+
+    pendingGroupMemberIds.push(id);
+    renderPendingGroupMembers();
+    input.value = '';
+    input.focus();
+}
+
+function removeGroupMember(id) {
+    pendingGroupMemberIds = pendingGroupMemberIds.filter(m => m !== id);
+    renderPendingGroupMembers();
+}
+
+function renderPendingGroupMembers() {
+    const container = document.getElementById('pendingGroupMembers');
+    container.innerHTML = pendingGroupMemberIds.map(id => `
+        <span style="background:#0f3460; color:white; padding:4px 10px; border-radius:14px; font-size:13px; display:flex; align-items:center; gap:6px;">
+            ${id}
+            <span onclick="removeGroupMember('${id}')" style="cursor:pointer; color:#ff6b6b; font-weight:bold;">×</span>
+        </span>
+    `).join('');
+}
+
 // ===== إنشاء مجموعة =====
 function createGroup() {
     const name = document.getElementById('groupNameInput').value.trim();
-    const membersInput = document.getElementById('groupMembersInput').value.trim();
     if (!name) {
         modalError('✏️ اكتب اسم للمجموعة');
-        return;
-    }
-    const members = membersInput ? membersInput.split(',').map(id => id.trim()) : [];
-    const uniqueMembers = [...new Set(members)];
-    if (uniqueMembers.includes(myId)) {
-        modalError('لا تضع ID خاصتك');
         return;
     }
 
@@ -1233,9 +1282,8 @@ function createGroup() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-            adminId: myId,
             name: name,
-            members: uniqueMembers
+            members: pendingGroupMemberIds
         })
     })
     .then(res => res.json())
@@ -1245,7 +1293,8 @@ function createGroup() {
         } else {
             modalSuccess('✅ تم إنشاء المجموعة!');
             document.getElementById('groupNameInput').value = '';
-            document.getElementById('groupMembersInput').value = '';
+            pendingGroupMemberIds = [];
+            renderPendingGroupMembers();
             loadGroups();
         }
     });
@@ -1709,7 +1758,7 @@ function openProfile() {
     document.getElementById('profilePage').style.display = 'flex';
 
     // جلب بيانات المستخدم
-    fetch(`/user/${myId}`)
+    authFetch(`/user/${myId}`)
     .then(res => res.json())
     .then(data => {
         if (!data.user) return;
