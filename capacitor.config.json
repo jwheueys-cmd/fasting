@@ -3,7 +3,7 @@
   "appName": "Fasting",
   "webDir": "public",
   "server": {
-    "url": "https://immune-luxury-analog-organize.trycloudflare.com",
+    "url": "https://fasting-7twu.onrender.com",
     "cleartext": true
   }
 }
